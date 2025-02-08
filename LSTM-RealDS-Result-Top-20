@@ -1,0 +1,42 @@
+import os
+import pandas as pd
+
+# Function to extract top 20 medication combinations based on time-step-1
+def extract_top_20(input_file, output_file):
+    # Load the predictions file
+    predictions = pd.read_csv(input_file)
+
+    # Extract the second row (time-step-1 values)
+    time_step_1_values = predictions.iloc[1, :]  # Second row (index 1)
+
+    # Convert the row to a Series and sort by values in descending order
+    sorted_columns = time_step_1_values.sort_values(ascending=False)
+
+    # Select the top 20 columns (medication combinations)
+    top_20_columns = sorted_columns.head(20).index
+
+    # Extract the top 20 columns from the original DataFrame
+    top_20_predictions = predictions[top_20_columns]
+
+    # Save the top 20 medication combinations to a new file
+    top_20_predictions.to_csv(output_file, index=False)
+    print(f"Saved top 20 predictions to {output_file}")
+
+
+# Main Execution
+if __name__ == "__main__":
+    # Define the folder containing the prediction files
+    input_folder = "./PredAll/"  # Change this to your folder path
+
+    # Define the output folder for top-20 files
+    output_folder = "./top_20_predictions/"
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Iterate over all prediction files in the input folder
+    for filename in os.listdir(input_folder):
+        if filename.endswith(".csv") and not filename.startswith("Top-20_"):
+            input_file = os.path.join(input_folder, filename)
+            output_file = os.path.join(output_folder, f"Top-20_{filename}")
+
+            # Extract and save the top 20 predictions
+            extract_top_20(input_file, output_file)
