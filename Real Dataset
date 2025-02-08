@@ -1,1 +1,211 @@
-Using LSTM for health trend prediction
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
+# Set random seeds
+torch.manual_seed(42)
+np.random.seed(42)
+
+# LSTM Model
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+
+# Dataset Class
+class PharmacyDataset(Dataset):
+    def __init__(self, sequences, targets):
+        self.sequences = sequences
+        self.targets = targets
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        x = torch.tensor(self.sequences[idx], dtype=torch.float32)
+        y = torch.tensor(self.targets[idx], dtype=torch.float32)
+        return x, y
+
+
+# Load Data
+def load_data(file_path, global_columns=None):
+    data = pd.read_csv(file_path)
+    data['addeddate'] = pd.to_datetime(data['addeddate'].astype(str).str.split().str[0], errors='coerce')
+    data.dropna(subset=['addeddate'], inplace=True)
+    data['month'] = data['addeddate'].dt.to_period('M')
+    data['medication_combination'] = data.groupby('Invoice')['name'].transform(lambda x: '+'.join(sorted(set(x))))
+
+    # Group by month and medication combination
+    grouped_data = data.groupby(['month', 'medication_combination']).size().unstack(fill_value=0)
+
+    # Align columns with global columns
+    if global_columns is not None:
+        grouped_data = grouped_data.reindex(columns=global_columns, fill_value=0)
+
+    return grouped_data
+
+
+# Create Sequences
+def create_sequences(data, seq_length=3):
+    sequences, targets = [], []
+    for i in range(len(data) - seq_length):
+        sequences.append(data.iloc[i:i + seq_length].values)
+        targets.append(data.iloc[i + seq_length].values)
+    return sequences, targets
+
+
+# Train Model
+def train_model(model, dataloader, criterion, optimizer, epochs=5):
+    model.train()
+    for epoch in range(epochs):
+        epoch_loss = 0
+        for x_batch, y_batch in dataloader:
+            optimizer.zero_grad()
+            loss = criterion(model(x_batch), y_batch)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {epoch_loss / len(dataloader):.4f}")
+
+
+# Aggregate Models
+def aggregate_models(models):
+    if not models:
+        return None
+
+    # Ensure all models have the same architecture
+    input_size = models[0].lstm.input_size
+    hidden_size = models[0].lstm.hidden_size
+    num_layers = models[0].lstm.num_layers
+    output_size = models[0].fc.out_features
+
+    # Create a new model with the same architecture
+    agg_model = LSTMModel(input_size, hidden_size, num_layers, output_size)
+
+    # Average the state_dict of all models
+    avg_state_dict = {key: torch.stack([m.state_dict()[key] for m in models]).mean(dim=0) for key in
+                      models[0].state_dict()}
+    agg_model.load_state_dict(avg_state_dict)
+
+    return agg_model
+
+# Predict Trends for All Medications
+def predict_trends(model, data, seq_length=3, steps=3):
+    model.eval()
+    inputs = torch.tensor(data.iloc[-seq_length:].values, dtype=torch.float32).unsqueeze(0)
+    predictions = []
+    for _ in range(steps):
+        with torch.no_grad():
+            pred = model(inputs).numpy()
+        predictions.append(pred)  # Keep predictions for all medications
+        inputs = torch.cat((inputs[:, 1:, :], torch.tensor(pred).unsqueeze(0)), dim=1)
+    return np.array(predictions)
+
+
+# Save Predictions for All Models at a Level
+def save_predictions(level_models, level_data, level):
+    if not level_models[level]:
+        return
+
+    # If level_models[level] is a list, iterate over each model
+    if isinstance(level_models[level], list):
+        for i, model in enumerate(level_models[level]):
+            predictions = predict_trends(model, level_data[level][i])
+            all_medications = level_data[level][i].columns  # Get all medication combinations
+            pred_df = pd.DataFrame(predictions.squeeze(), columns=all_medications)
+            pred_df.to_csv(f"{level}_predictions_{i}.csv", index=False)
+            print(f"Saved {level} predictions for model {i}.")
+    else:
+        # If level_models[level] is a single model (e.g., national level)
+        predictions = predict_trends(level_models[level], level_data[level])
+        all_medications = level_data[level].columns  # Get all medication combinations
+        pred_df = pd.DataFrame(predictions.squeeze(), columns=all_medications)
+        pred_df.to_csv(f"{level}_predictions.csv", index=False)
+        print(f"Saved {level} predictions.")
+
+
+# Main Execution
+if __name__ == "__main__":
+    output_folder = "./outputDateUni/"
+    cities = ["City1", "City2", "City3"]
+    zones_per_city = 3
+    pharmacies_per_zone = 4
+    seq_length = 3
+
+    level_models = {'pharmacy': [], 'zone': [], 'city': [], 'national': None}
+    level_data = {'zone': [], 'city': [], 'national': None}
+
+    # Step 1: Collect all medication combinations to create a global column set
+    all_columns = set()
+    for city in cities:
+        for zone in range(1, zones_per_city + 1):
+            for pharmacy in range(1, pharmacies_per_zone + 1):
+                pharmacy_path = os.path.join(output_folder, city, f"Zone{zone}",
+                                             f"Ph{pharmacy:02d}_Z{zone:02d}_C{cities.index(city) + 1:02d}.csv")
+                if os.path.exists(pharmacy_path):
+                    data = pd.read_csv(pharmacy_path)
+                    data['medication_combination'] = data.groupby('Invoice')['name'].transform(
+                        lambda x: '+'.join(sorted(set(x))))
+                    all_columns.update(data['medication_combination'].unique())
+
+    # Convert to a sorted list for consistent ordering
+    global_columns = sorted(all_columns)
+
+    # Step 2: Train models with aligned columns
+    for city in cities:
+        for zone in range(1, zones_per_city + 1):
+            zone_data = []
+            zone_models = []
+            for pharmacy in range(1, pharmacies_per_zone + 1):
+                pharmacy_path = os.path.join(output_folder, city, f"Zone{zone}",
+                                             f"Ph{pharmacy:02d}_Z{zone:02d}_C{cities.index(city) + 1:02d}.csv")
+                if os.path.exists(pharmacy_path):
+                    df = load_data(pharmacy_path, global_columns=global_columns)
+                    zone_data.append(df)
+
+            if not zone_data:
+                continue
+
+            # Merge zone data
+            merged_data = sum(zone_data) / len(zone_data)
+            sequences, targets = create_sequences(merged_data, seq_length)
+            if not sequences:
+                continue
+
+            dataset = PharmacyDataset(sequences, targets)
+            dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+            model = LSTMModel(input_size=merged_data.shape[1], hidden_size=64, num_layers=2,
+                              output_size=merged_data.shape[1])
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+            criterion = nn.MSELoss()
+
+            print(f"Training Zone {zone} in {city}...")
+            train_model(model, dataloader, criterion, optimizer, epochs=2)
+            level_models['zone'].append(model)
+            level_data['zone'].append(merged_data)
+
+    # Step 3: Aggregate models at the city level
+    for i in range(0, len(level_models['zone']), 3):
+        city_models = level_models['zone'][i:i + 3]
+        city_data = level_data['zone'][i:i + 3]
+        if city_models:
+            level_models['city'].append(aggregate_models(city_models))
+            level_data['city'].append(sum(city_data) / len(city_data))
+
+    # Step 4: Aggregate models at the national level
+    if level_models['city']:
+        level_models['national'] = aggregate_models(level_models['city'])
+        level_data['national'] = sum(level_data['city']) / len(level_data['city'])
+
+    # Step 5: Save predictions
+    for level in level_models:
+        save_predictions(level_models, level_data, level)
